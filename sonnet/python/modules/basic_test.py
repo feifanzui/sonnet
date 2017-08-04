@@ -71,9 +71,6 @@ class LinearTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
     self.assertEqual(lin.scope_name, "scope/" + mod_name)
     self.assertEqual(lin.module_name, mod_name)
 
-    # Test deprecated name.
-    self.assertEqual(lin.name, "scope/" + mod_name)
-
   @parameterized.NamedParameters(
       ("WithBias", True),
       ("WithoutBias", False))
@@ -115,6 +112,29 @@ class LinearTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
       else:
         shape = np.ndarray(self.out_size)
       self.assertShapeEqual(shape, v.initial_value)
+
+  def testCustomGetter(self):
+    """Check that custom getters work appropriately."""
+
+    def custom_getter(getter, *args, **kwargs):
+      kwargs["trainable"] = False
+      return getter(*args, **kwargs)
+
+    inputs = tf.placeholder(tf.float32, shape=[self.batch_size, self.in_size])
+
+    # Make w and b non-trainable.
+    lin1 = snt.Linear(output_size=self.out_size,
+                      custom_getter=custom_getter)
+    lin1(inputs)
+    self.assertEqual(0, len(tf.trainable_variables()))
+    self.assertEqual(2, len(tf.global_variables()))
+
+    # Make w non-trainable.
+    lin2 = snt.Linear(output_size=self.out_size,
+                      custom_getter={"w": custom_getter})
+    lin2(inputs)
+    self.assertEqual(1, len(tf.trainable_variables()))
+    self.assertEqual(4, len(tf.global_variables()))
 
   @parameterized.NamedParameters(
       ("WithBias", True),
@@ -425,6 +445,35 @@ class LinearTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
     self.assertEqual(type(linear.w), variables.PartitionedVariable)
     self.assertEqual(type(linear.b), variables.PartitionedVariable)
 
+  @parameterized.NamedParameters(
+      ("float16", tf.float16),
+      ("float32", tf.float32),
+      ("float64", tf.float64))
+  def testFloatDataTypeConsistent(self, dtype):
+    inputs = tf.placeholder(dtype, [3, 7])
+    linear = snt.Linear(11)
+    outputs = linear(inputs)
+    self.assertEqual(linear.w.dtype.base_dtype, dtype)
+    self.assertEqual(linear.b.dtype.base_dtype, dtype)
+    self.assertEqual(outputs.dtype.base_dtype, dtype)
+
+  def testIntegerDataTypeFailsWithDefaultInitializers(self):
+    dtype = tf.int32
+    inputs = tf.placeholder(dtype, [3, 7])
+    linear = snt.Linear(11)
+    with self.assertRaisesRegexp(ValueError, "Expected floating point type"):
+      unused_outputs = linear(inputs)
+
+  def testIntegerDataTypeConsistentWithCustomWeightInitializer(self):
+    dtype = tf.int32
+    inputs = tf.placeholder(dtype, [3, 7])
+    linear = snt.Linear(
+        11, initializers={"w": tf.zeros_initializer(dtype=dtype)})
+    outputs = linear(inputs)
+    self.assertEqual(linear.w.dtype.base_dtype, dtype)
+    self.assertEqual(linear.b.dtype.base_dtype, dtype)
+    self.assertEqual(outputs.dtype.base_dtype, dtype)
+
 
 class AddBiasTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
 
@@ -502,22 +551,30 @@ class AddBiasTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
                         initializers={"b": _test_initializer()},
                         regularizers={"b": b_regularizer})
       output = add(inputs)
+      output_subtract = add(inputs, multiplier=-1)
       with self.test_session() as sess:
         # With random data, check the TF calculation matches the Numpy version.
         input_data = np.random.randn(*self.mb_in_shape).astype(
             dtype.as_numpy_dtype)
         sess.run(tf.global_variables_initializer())
-        output_data, b = sess.run([output, add.b],
-                                  {inputs: input_data})
+        output_data, output_subtract_data, b = sess.run(
+            [output, output_subtract, add.b], {inputs: input_data})
         regularizers = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
         self.assertRegexpMatches(regularizers[0].name, ".*l2_regularizer.*")
       if not bias_shape:  # Scalar bias.
-        result = input_data + np.array([b]).astype(dtype.as_numpy_dtype(b))
+        b_array = np.array([b]).astype(dtype.as_numpy_dtype(b))
       else:
-        result = input_data + b.astype(dtype.as_numpy_dtype)
+        b_array = b.astype(dtype.as_numpy_dtype)
+      result = input_data + b_array
+      result_subtract = input_data - b_array
       self.assertAllClose(
           result,
           output_data,
+          atol=tolerance_map[dtype],
+          rtol=tolerance_map[dtype])
+      self.assertAllClose(
+          result_subtract,
+          output_subtract_data,
           atol=tolerance_map[dtype],
           rtol=tolerance_map[dtype])
 
@@ -770,7 +827,8 @@ class TrainableVariableTest(tf.test.TestCase):
     self.assertEqual(type(var.w), variables.PartitionedVariable)
 
 
-class BatchReshapeTest(tf.test.TestCase):
+class BatchReshapeTest(tf.test.TestCase,
+                       parameterized.ParameterizedTestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -794,20 +852,20 @@ class BatchReshapeTest(tf.test.TestCase):
     in_shape = [2, 3, 4, 5]
     inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
     # Shape array has invalid format
-    err = "Wildcard -1 can appear only once in shape"
+    err = "Wildcard -1 can appear only once in desired output shape. "
     with self.assertRaisesRegexp(ValueError, err):
       output_invalid_shape_format = [-1, -1]
       snt.BatchReshape(shape=output_invalid_shape_format)(inputs)
 
-    err = ("Input array shape can contain positive integral numbers only,"
-           " and the wildcard -1 used once")
+    err = ("Desired shape can only contain positive integral numbers "
+           "and the wildcard -1. ")
     with self.assertRaisesRegexp(ValueError, err):
       output_invalid_shape_format = [2, 3, -2]
       snt.BatchReshape(shape=output_invalid_shape_format)(inputs)
 
     # Shape array contains invalid entries
-    err = ("Input array shape can contain positive integral numbers only,"
-           " and the wildcard -1 used once")
+    err = ("Desired shape can only contain positive integral numbers "
+           "and the wildcard -1. ")
     with self.assertRaisesRegexp(ValueError, err):
       invalid_shape_type = [7, "string"]
       snt.BatchReshape(shape=invalid_shape_type)(inputs)
@@ -839,6 +897,54 @@ class BatchReshapeTest(tf.test.TestCase):
     output = mod(inputs)
     self.assertEqual(output.get_shape(), [batch_size] + correct_out_size)
 
+  def testAddDimensions(self):
+    batch_size = 10
+    in_shape = []
+    out_size = [1, 1]
+    correct_out_size = [1, 1]
+    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape(), [batch_size] + correct_out_size)
+    # Transposition should also work
+    mod_t = mod.transpose()
+    t_output = mod_t(output)
+    self.assertEqual(t_output.get_shape(), [batch_size] + in_shape)
+
+  def testNoReshapeNeeded(self):
+    batch_size = 10
+    in_shape = [None]
+    out_size = [-1]
+    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    self.assertIs(output, inputs)
+
+    in_shape = [10]
+    out_size = [10]
+    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    self.assertIs(output, inputs)
+
+  @parameterized.NamedParameters(
+      ("BadUnknown1", (None,), (5,)),
+      ("BadUnknown2", (None, None), (5,)),
+      ("BadUnknown3", (None, None), (5, 5)),
+      ("BadUnknown4", (5, None), (5, 5)),
+      ("BadUnknown5", (None, 5), (5, 5)),
+  )
+  def testBadUnknownNonPreservedDimensions(self, input_shape, output_shape):
+    preserved_shape = (10,)
+    shape = preserved_shape + input_shape
+    preserve_dims = len(preserved_shape)
+    inputs = tf.placeholder(tf.float32, shape)
+    mod = snt.BatchReshape(shape=output_shape,
+                           preserve_dims=preserve_dims)
+    err = "Unknown non-preserved dimensions are not allowed"
+    with self.assertRaisesRegexp(ValueError, err):
+      _ = mod(inputs)
+
   def testFlatten(self):
     batch_size = 10
     in_shape = [2, 3, 4, 5]
@@ -848,6 +954,17 @@ class BatchReshapeTest(tf.test.TestCase):
     output = mod(inputs)
     flattened_shape = np.prod(in_shape)
     self.assertEqual(output.get_shape(), [batch_size, flattened_shape])
+
+  def testUnknown(self):
+    batch_size = None
+    in_shape = [2, 3, 4, 5]
+    out_size = [-1]
+    inputs = tf.placeholder(tf.float32, shape=[batch_size] + in_shape)
+    mod = snt.BatchReshape(shape=out_size)
+    output = mod(inputs)
+    flattened_shape = np.prod(in_shape)
+    self.assertEqual(output.get_shape().as_list(),
+                     [batch_size, flattened_shape])
 
   def testTranspose(self):
     batch_size = 10
@@ -870,8 +987,72 @@ class BatchReshapeTest(tf.test.TestCase):
       input_data, out = sess.run([inputs, output])
       self.assertAllClose(out, input_data)
 
+  def testInvalidPreserveDimsError(self):
+    with self.assertRaisesRegexp(ValueError, "preserve_dims"):
+      snt.BatchReshape((-1,), preserve_dims=0)
 
-class BatchFlattenTest(tf.test.TestCase):
+  def testBuildDimError(self):
+    mod = snt.BatchReshape((-1,), preserve_dims=2)
+    input_tensor = tf.placeholder(tf.float32, (50,))
+    with self.assertRaisesRegexp(ValueError, "preserve_dims"):
+      mod(input_tensor)
+
+  def testBuildUnknown(self):
+    mod = snt.BatchReshape(shape=(2, 9), preserve_dims=2)
+    shape = [50, None, 6, 3]
+    inputs = tf.placeholder(tf.float32, shape)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), [50, None, 2, 9])
+
+  @parameterized.NamedParameters(
+      ("Preserve1", (1,)),
+      ("Preserve24", (2, 4)),
+      ("Preserve?", (None,)),
+      ("Preserve?5", (None, 5)),
+      ("Preserve5?", (5, None)),
+      ("Preserve??", (None, None)))
+  def testPreserve(self, preserve):
+    shape = list(preserve) + [13, 84, 3, 2]
+    output_shape = [13, 21, 3, 8]
+    preserve_dims = len(preserve)
+    inputs = tf.placeholder(tf.float32, shape)
+    mod = snt.BatchReshape(shape=output_shape,
+                           preserve_dims=preserve_dims)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(),
+                     list(preserve) + output_shape)
+
+  @parameterized.NamedParameters(
+      ("Session1", (1,), (2, 3), (-1,)),
+      ("Session2", (1, 7), (2, 3), (-1,)),
+      ("Session3", (None,), (2, 3), (-1,)),
+      ("Session4", (None, 5, None), (2, 3, 4), (4, 6)),
+      ("Session5", (None, None, None), (2, 3, 4), (-1,)),
+      ("Session6", (5, None, None), (1, 3, 1), (-1,)),
+      ("Session7", (1,), (4, 3), (2, 2, 1, 3)),
+      ("Session8", (None,), (4, 3), (2, 2, 1, 3)),
+      ("Session9", (1, None, 5, None), (4, 3), (2, 2, -1, 3)))
+  def testRun(self, preserve, trailing_in, trailing_out):
+    rng = np.random.RandomState(0)
+    input_shape = preserve + trailing_in
+    output_shape = preserve + np.zeros(trailing_in).reshape(trailing_out).shape
+    inputs = tf.placeholder(tf.float32, input_shape)
+    mod = snt.BatchReshape(shape=trailing_out,
+                           preserve_dims=len(preserve))
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), list(output_shape))
+
+    actual_input_shape = [13 if i is None else i for i in input_shape]
+    expected_output_shape = [13 if i is None else i for i in output_shape]
+    actual_input = rng.rand(*actual_input_shape).astype(np.float32)
+    expected_output = actual_input.reshape(expected_output_shape)
+    with self.test_session() as sess:
+      actual_output = sess.run(output, feed_dict={inputs: actual_input})
+    self.assertAllEqual(actual_output, expected_output)
+
+
+class BatchFlattenTest(tf.test.TestCase,
+                       parameterized.ParameterizedTestCase):
 
   def testName(self):
     mod_name = "unique_name"
@@ -888,6 +1069,25 @@ class BatchFlattenTest(tf.test.TestCase):
     output = mod(inputs)
     flattened_size = np.prod(in_shape)
     self.assertEqual(output.get_shape(), [batch_size, flattened_size])
+
+  @parameterized.Parameters(1, 2, 3, 4)
+  def testPreserveDimsOk(self, preserve_dims):
+    in_shape = [10, 2, 3, 4]
+    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    mod = snt.BatchFlatten(preserve_dims=preserve_dims)
+    output = mod(inputs)
+    flattened_shape = (in_shape[:preserve_dims] +
+                       [np.prod(in_shape[preserve_dims:])])
+    self.assertEqual(output.get_shape(), flattened_shape)
+
+  @parameterized.Parameters(5, 6, 7, 10)
+  def testPreserveDimsError(self, preserve_dims):
+    in_shape = [10, 2, 3, 4]
+    inputs = tf.placeholder(tf.float32, shape=in_shape)
+    err = "Input tensor has 4 dimensions"
+    mod = snt.BatchFlatten(preserve_dims=preserve_dims)
+    with self.assertRaisesRegexp(ValueError, err):
+      _ = mod(inputs)
 
   def testFlattenWithZeroDim(self):
     inputs = tf.placeholder(tf.float32, shape=[1, 0])
@@ -911,15 +1111,16 @@ class FlattenTrailingDimensionsTest(tf.test.TestCase,
 
   def testBuildDimError(self):
     mod = snt.FlattenTrailingDimensions(dim_from=2)
-    input_tensor = tf.placeholder(tf.float32, (50, 5))
+    input_tensor = tf.placeholder(tf.float32, (50,))
     with self.assertRaisesRegexp(ValueError, "dim_from"):
       mod(input_tensor)
 
-  def testBuildUnknownError(self):
+  def testBuildUnknown(self):
     mod = snt.FlattenTrailingDimensions(dim_from=2)
-    input_tensor = tf.placeholder(tf.float32, (50, None, 5))
-    with self.assertRaisesRegexp(ValueError, "statically unknown"):
-      mod(input_tensor)
+    shape = [50, None, 5]
+    inputs = tf.placeholder(tf.float32, shape)
+    output = mod(inputs)
+    self.assertEqual(output.get_shape().as_list(), shape)
 
   @parameterized.NamedParameters(
       ("BatchSize1", 1),
@@ -1117,6 +1318,46 @@ class BatchApplyTest(tf.test.TestCase, parameterized.ParameterizedTestCase):
     with self.test_session() as sess:
       out_expected, out_result = sess.run([expected_output, output])
       self.assertAllClose(out_expected, out_result)
+
+  def testKWArgs(self):
+    in1 = np.random.randn(2, 3, 4, 5)
+    in2 = np.random.randn(2, 3, 5, 8)
+
+    module = snt.BatchApply(tf.matmul)
+    output = module(a=in1, b=in2)
+    output.get_shape().assert_is_compatible_with([2, 3, 4, 8])
+
+    expected_output = tf.matmul(in1, in2)
+    with self.test_session() as sess:
+      out_expected, out_result = sess.run([expected_output, output])
+      self.assertAllClose(out_expected, out_result)
+
+  def testHandlesReturnedNone(self):
+    def fn(input_):
+      del input_
+      return None
+    result = snt.BatchApply(fn)(tf.zeros([1, 1]))
+    self.assertEqual(result, None)
+
+  def testSomeInputsAreNone(self):
+    in1 = np.random.randn(2, 3, 4, 5)
+    in2 = np.random.randn(2, 3, 5, 8)
+    in3 = None
+
+    def build(input1, input2, input3):
+      output = tf.matmul(input1, input2)
+      if input3 is not None:
+        output = tf.matmul(input3)
+      return output
+
+    module = snt.BatchApply(build)
+    output = module(in1, in2, in3)
+    output.get_shape().assert_is_compatible_with([2, 3, 4, 8])
+
+    expected_output = tf.matmul(in1, in2)
+    with self.test_session() as sess:
+      out_expected, out_result = sess.run([expected_output, output])
+    self.assertAllClose(out_expected, out_result)
 
 
 class SliceByDimTest(tf.test.TestCase):

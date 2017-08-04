@@ -35,6 +35,9 @@ from sonnet.python.modules import util
 import tensorflow as tf
 
 
+# Strings for TensorFlow convolution padding modes. See the following
+# documentation for an explanation of VALID versus SAME:
+# https://www.tensorflow.org/api_guides/python/nn#Convolution
 SAME = "SAME"
 VALID = "VALID"
 ALLOWED_PADDINGS = {SAME, VALID}
@@ -42,6 +45,60 @@ ALLOWED_PADDINGS = {SAME, VALID}
 DATA_FORMAT_NCHW = "NCHW"
 DATA_FORMAT_NHWC = "NHWC"
 SUPPORTED_DATA_FORMATS = {DATA_FORMAT_NCHW, DATA_FORMAT_NHWC}
+
+
+def _default_transpose_size(input_shape, stride, kernel_shape=None,
+                            padding=SAME):
+  """Returns default (maximal) output shape for a transpose convolution.
+
+  In general, there are multiple possible output shapes that a transpose
+  convolution with a given `input_shape` can map to. This function returns the
+  output shape which evenly divides the stride to produce the input shape in
+  a forward convolution, i.e. the maximal valid output shape with the given
+  configuration:
+
+  if the padding type is SAME then:  output_shape = input_shape * stride
+  if the padding type is VALID then: output_shape = input_shape * stride +
+                                                    kernel_shape - 1
+
+  See the following documentation for an explanation of VALID versus SAME
+  padding modes:
+  https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+
+  Args:
+    input_shape: Sequence of sizes of each dimension of the input, excluding
+      batch and channel dimensions.
+    stride: Sequence or integer of kernel strides, excluding batch and channel
+      dimension strides.
+    kernel_shape: Sequence or integer of kernel sizes.
+    padding: Padding algorithm, either `snt.SAME` or `snt.VALID`.
+
+  Returns:
+    output_shape: A tuple of sizes for a transposed convolution that divide
+      evenly with the given strides, kernel shapes, and padding algorithm.
+
+  Raises:
+    TypeError: if `input_shape` is not a Sequence;
+  """
+  if not isinstance(input_shape, collections.Sequence):
+    if input_shape is None:
+      raise TypeError("input_shape is None; if using Sonnet, are you sure you "
+                      "have connected the module to inputs?")
+    raise TypeError("input_shape is of type {}, must be a sequence."
+                    .format(type(input_shape)))
+
+  input_length = len(input_shape)
+  stride = _fill_and_verify_parameter_shape(stride, input_length, "stride")
+  padding = _verify_padding(padding)
+
+  output_shape = tuple(x * y for x, y in zip(input_shape, stride))
+
+  if padding == VALID:
+    kernel_shape = _fill_and_verify_parameter_shape(kernel_shape, input_length,
+                                                    "kernel")
+    output_shape = tuple(x + y - 1 for x, y in zip(output_shape, kernel_shape))
+
+  return output_shape
 
 
 def _fill_shape(x, n):
@@ -131,12 +188,13 @@ class Conv2D(base.AbstractModule, base.Transposable):
   def __init__(self, output_channels, kernel_shape, stride=1, rate=1,
                padding=SAME, use_bias=True, initializers=None,
                partitioners=None, regularizers=None, mask=None,
-               data_format=DATA_FORMAT_NHWC, name="conv_2d"):
+               data_format=DATA_FORMAT_NHWC, custom_getter=None,
+               name="conv_2d"):
     """Constructs a Conv2D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. `output_channels` can be
@@ -173,6 +231,10 @@ class Conv2D(base.AbstractModule, base.Transposable):
       data_format: A string. Specifies whether the channel dimension
           of the input and output is the last dimension (default, NHWC), or the
           second dimension ("NCHW").
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -195,7 +257,7 @@ class Conv2D(base.AbstractModule, base.Transposable):
         are not callable.
       TypeError: If mask is given and is not an array, tuple or a numpy array.
     """
-    super(Conv2D, self).__init__(name=name)
+    super(Conv2D, self).__init__(custom_getter=custom_getter, name=name)
 
     self._output_channels = output_channels
     self._input_shape = None
@@ -335,8 +397,6 @@ class Conv2D(base.AbstractModule, base.Transposable):
           raise base.IncompatibleShapeError(
               "Invalid mask shape: {}".format(mask_shape))
         mask = self._mask
-      mask_tensor, = tf.py_func(lambda: mask, [], [w.dtype], stateful=False)
-      mask_tensor.set_shape(weight_shape)
       w *= mask
 
     outputs = tf.nn.convolution(inputs, w, strides=self._stride,
@@ -460,6 +520,7 @@ class Conv2D(base.AbstractModule, base.Transposable):
                   regularizers=self.regularizers,
                   mask=self.mask,
                   data_format=self.data_format,
+                  custom_getter=self._custom_getter,
                   name=name)
 
   # Implements Transposable interface.
@@ -506,6 +567,7 @@ class Conv2D(base.AbstractModule, base.Transposable):
                            partitioners=self.partitioners,
                            regularizers=self.regularizers,
                            data_format=self._data_format,
+                           custom_getter=self._custom_getter,
                            name=name)
 
 
@@ -516,15 +578,16 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
   abstracting away variable creation and sharing.
   """
 
-  def __init__(self, output_channels, output_shape, kernel_shape, stride=1,
-               padding=SAME, use_bias=True, initializers=None,
+  def __init__(self, output_channels, output_shape=None, kernel_shape=None,
+               stride=1, padding=SAME, use_bias=True, initializers=None,
                partitioners=None, regularizers=None,
-               data_format=DATA_FORMAT_NHWC, name="conv_2d_transpose"):
+               data_format=DATA_FORMAT_NHWC, custom_getter=None,
+               name="conv_2d_transpose"):
     """Constructs a `Conv2DTranspose module`.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels.
@@ -538,7 +601,9 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
           time, the user must only ensure that `output_shape` can be called,
           returning an iterable of format `(out_height, out_width)` when `build`
           is called. Note that `output_shape` defines the size of output signal
-          domain, as opposed to the shape of the output `Tensor`.
+          domain, as opposed to the shape of the output `Tensor`. If a None
+          value is given, a default shape is automatically calculated (see
+          docstring of _default_transpose_size function for more details).
       kernel_shape: Sequence of kernel sizes (of size 2), or integer that is
           used to define kernel size in all dimensions.
       stride: Sequence of kernel strides (of size 2), or integer that is used to
@@ -558,6 +623,10 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
       data_format: A string. Specifies whether the channel dimension
           of the input and output is the last dimension (default, NHWC), or the
           second dimension ("NCHW").
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -568,18 +637,28 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
       ValueError: If the given padding is not `snt.VALID` or `snt.SAME`.
       ValueError: If the given data_format is not a supported format (see
         SUPPORTED_DATA_FORMATS).
+      ValueError: If the given kernel_shape is `None`.
       KeyError: If `initializers`, `partitioners` or `regularizers` contain any
         keys other than 'w' or 'b'.
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(Conv2DTranspose, self).__init__(name=name)
+    super(Conv2DTranspose, self).__init__(custom_getter=custom_getter,
+                                          name=name)
 
     self._output_channels = output_channels
-    if callable(output_shape):
-      self._output_shape = output_shape
+
+    if output_shape is None:
+      self._output_shape = None
+      self._use_default_output_shape = True
     else:
-      self._output_shape = tuple(output_shape)
+      self._use_default_output_shape = False
+      if callable(output_shape):
+        self._output_shape = output_shape
+      else:
+        self._output_shape = _fill_and_verify_parameter_shape(output_shape, 2,
+                                                              "output_shape")
+
     self._input_shape = None
 
     if data_format not in SUPPORTED_DATA_FORMATS:
@@ -588,6 +667,8 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
 
     self._data_format = data_format
 
+    if kernel_shape is None:
+      raise ValueError("`kernel_shape` cannot be None.")
     self._kernel_shape = _fill_and_verify_parameter_shape(kernel_shape, 2,
                                                           "kernel")
     # We want to support passing native strides akin to [1, m, n, 1].
@@ -659,6 +740,13 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
     if inputs.dtype != tf.float32:
       raise TypeError("Input must have dtype tf.float32, but dtype was " +
                       inputs.dtype)
+
+    if self._use_default_output_shape:
+      self._output_shape = (
+          lambda: _default_transpose_size(self._input_shape[1:-1],  # pylint: disable=g-long-lambda
+                                          self.stride[1:-1],
+                                          kernel_shape=self.kernel_shape,
+                                          padding=self.padding))
 
     if len(self.output_shape) != 2:
       raise base.IncompatibleShapeError("Output shape must be specified as "
@@ -748,6 +836,8 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
   @property
   def output_shape(self):
     """Returns the output shape."""
+    if self._output_shape is None:
+      self._ensure_is_connected()
     if callable(self._output_shape):
       self._output_shape = tuple(self._output_shape())
     return self._output_shape
@@ -829,8 +919,9 @@ class Conv2DTranspose(base.AbstractModule, base.Transposable):
                   initializers=self.initializers,
                   partitioners=self.partitioners,
                   regularizers=self.regularizers,
-                  name=name,
-                  data_format=self._data_format)
+                  data_format=self._data_format,
+                  custom_getter=self._custom_getter,
+                  name=name)
 
 
 
@@ -843,12 +934,13 @@ class Conv1D(base.AbstractModule, base.Transposable):
 
   def __init__(self, output_channels, kernel_shape, stride=1, rate=1,
                padding=SAME, use_bias=True, initializers=None,
-               partitioners=None, regularizers=None, name="conv_1d"):
+               partitioners=None, regularizers=None, custom_getter=None,
+               name="conv_1d"):
     """Constructs a Conv1D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. `output_channels` can be
@@ -880,6 +972,10 @@ class Conv1D(base.AbstractModule, base.Transposable):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -897,7 +993,7 @@ class Conv1D(base.AbstractModule, base.Transposable):
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(Conv1D, self).__init__(name=name)
+    super(Conv1D, self).__init__(custom_getter=custom_getter, name=name)
 
     self._output_channels = output_channels
     self._input_shape = None
@@ -1100,6 +1196,7 @@ class Conv1D(base.AbstractModule, base.Transposable):
                            initializers=self.initializers,
                            partitioners=self.partitioners,
                            regularizers=self.regularizers,
+                           custom_getter=self._custom_getter,
                            name=name)
 
 
@@ -1111,14 +1208,15 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
   image to 1.
   """
 
-  def __init__(self, output_channels, output_shape, kernel_shape, stride=1,
-               padding=SAME, use_bias=True, initializers=None,
-               partitioners=None, regularizers=None, name="conv_1d_transpose"):
+  def __init__(self, output_channels, output_shape=None, kernel_shape=None,
+               stride=1, padding=SAME, use_bias=True, initializers=None,
+               partitioners=None, regularizers=None, custom_getter=None,
+               name="conv_1d_transpose"):
     """Constructs a Conv1DTranspose module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. Can be either a number or a
@@ -1130,7 +1228,9 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
           number or a callable. In the latter case, since the function
           invocation is deferred to graph construction time, the user must only
           ensure that `output_shape` can be called, returning an iterable of
-          format `(out_length)` when build is called.
+          format `(out_length)` when build is called. If a None
+          value is given, a default shape is automatically calculated (see
+          docstring of _default_transpose_size function for more details).
       kernel_shape: Sequence of kernel sizes (of size 1), or integer that is
           used to define kernel size in all dimensions.
       stride: Sequence of kernel strides (of size 1), or integer that is used to
@@ -1147,6 +1247,10 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -1155,21 +1259,33 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
       base.IncompatibleShapeError: If the given stride is not an integer; or if
           the given stride is not a sequence of two or four integers.
       ValueError: If the given padding is not `snt.VALID` or `snt.SAME`.
+      ValueError: If the given kernel_shape is `None`.
       KeyError: If `initializers`, `partitioners` or `regularizers` contain any
         keys other than 'w' or 'b'.
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(Conv1DTranspose, self).__init__(name=name)
+    super(Conv1DTranspose, self).__init__(custom_getter=custom_getter,
+                                          name=name)
 
     self._output_channels = output_channels
-    if callable(output_shape):
-      self._output_shape = output_shape
-    elif isinstance(output_shape, numbers.Integral):
-      self._output_shape = (output_shape,)
-    elif isinstance(output_shape, collections.Iterable):
-      self._output_shape = tuple(output_shape)
+
+    if output_shape is None:
+      self._output_shape = None
+      self._use_default_output_shape = True
+    else:
+      self._use_default_output_shape = False
+      if callable(output_shape):
+        self._output_shape = output_shape
+      elif isinstance(output_shape, numbers.Integral):
+        self._output_shape = (output_shape,)
+      elif isinstance(output_shape, collections.Iterable):
+        self._output_shape = tuple(output_shape)
+
     self._input_shape = None
+
+    if kernel_shape is None:
+      raise ValueError("`kernel_shape` cannot be None.")
     self._kernel_shape = _fill_and_verify_parameter_shape(kernel_shape, 1,
                                                           "kernel")
     # We want to support passing 'native' strides akin to [1, m, 1].
@@ -1218,17 +1334,12 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
           of dimensions.
       base.IncompatibleShapeError: If the input tensor has an unknown
           `input_channels`.
-      base.UnderspecifiedError: If the input tensor has unknown `batch_size`.
       base.IncompatibleShapeError: If `output_shape` is not an integer or
           iterable of length 1.
       TypeError: If input Tensor dtype is not tf.float32.
     """
     # Handle input whose shape is unknown during graph creation.
     self._input_shape = tuple(inputs.get_shape().as_list())
-
-    if len(self._output_shape) != 1:
-      raise base.IncompatibleShapeError(
-          "Output shape must be specified as (output_length)")
 
     if len(self._input_shape) != 3:
       raise base.IncompatibleShapeError(
@@ -1240,10 +1351,16 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
           "Number of input channels must be known at module build time")
     input_channels = self._input_shape[2]
 
-    if self._input_shape[0] is None:
-      raise base.UnderspecifiedError(
-          "Batch size must be known at module build time")
-    batch_size = self._input_shape[0]
+    if self._use_default_output_shape:
+      self._output_shape = (
+          lambda: _default_transpose_size(self._input_shape[1:-1],  # pylint: disable=g-long-lambda
+                                          self.stride[2],
+                                          kernel_shape=self.kernel_shape,
+                                          padding=self.padding))
+
+    if len(self.output_shape) != 1:
+      raise base.IncompatibleShapeError(
+          "Output shape must be specified as (output_length)")
 
     if inputs.dtype != tf.float32:
       raise TypeError("Input must have dtype tf.float32, but dtype was {}"
@@ -1270,8 +1387,12 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
                               partitioner=self._partitioners.get("w", None),
                               regularizer=self._regularizers.get("w", None))
 
-    tf_out_shape = ((batch_size, 1,) + self._output_shape +
-                    (self.output_channels,))
+    batch_size = tf.expand_dims(tf.shape(inputs)[0], 0)
+    out_shape = (1, self.output_shape[0])
+    out_channels = (self.output_channels,)
+    out_shape_tuple = out_shape + out_channels
+    conv_output_shape = tf.convert_to_tensor(out_shape_tuple)
+    tf_out_shape = tf.concat([batch_size, conv_output_shape], 0)
 
     # Add an extra dimension to the input - a height of 1.
     inputs = tf.expand_dims(inputs, 1)
@@ -1293,6 +1414,11 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
     # Remove the superfluous height dimension to return a 3D tensor.
     outputs = tf.squeeze(outputs, [1])
 
+    # Set the tensor sizes in order for shape inference.
+    batch_size_value = inputs.get_shape()[0]
+    output_shape_value = ((batch_size_value,) + self.output_shape +
+                          (self.output_channels,))
+    outputs.set_shape(output_shape_value)
     return outputs
 
   @property
@@ -1315,6 +1441,8 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
   @property
   def output_shape(self):
     """Returns the output shape."""
+    if self._output_shape is None:
+      self._ensure_is_connected()
     if callable(self._output_shape):
       self._output_shape = self._output_shape()
     return self._output_shape
@@ -1396,7 +1524,177 @@ class Conv1DTranspose(base.AbstractModule, base.Transposable):
                   initializers=self.initializers,
                   partitioners=self.partitioners,
                   regularizers=self.regularizers,
+                  custom_getter=self._custom_getter,
                   name=name)
+
+
+class CausalConv1D(Conv1D):
+  """1D convolution module, including optional bias.
+
+  This acts as a light wrapper around Conv1D ensuring that the outputs at index
+  `i` only depend on indices smaller than `i` (also known as a causal
+  convolution). For further details on the theoretical background, refer to:
+
+  https://arxiv.org/abs/1610.10099
+  """
+
+  def __init__(self,
+               output_channels,
+               kernel_shape,
+               stride=1,
+               rate=1,
+               use_bias=True,
+               initializers=None,
+               partitioners=None,
+               regularizers=None,
+               custom_getter=None,
+               name="causal_conv_1d"):
+    """Constructs a CausalConv1D module.
+
+    Args:
+      output_channels: Number of output channels. `output_channels` can be
+          either a number or a callable. In the latter case, since the function
+          invocation is deferred to graph construction time, the user must only
+          ensure that output_channels can be called, returning an integer,
+          when `build` is called.
+      kernel_shape: Sequence of kernel sizes (of size 1), or integer that is
+          used to define kernel size in all dimensions.
+      stride: Sequence of kernel strides (of size 1), or integer that is used to
+          define stride in all dimensions.
+      rate: Sequence of dilation rates (of size 1), or integer that is used to
+          define dilation rate in all dimensions. 1 corresponds to standard 2D
+          convolution, `rate > 1` corresponds to dilated convolution. Cannot be
+          > 1 if any of `stride` is also > 1.
+      use_bias: Whether to include bias parameters. Default `True`.
+      initializers: Optional dict containing ops to initialize the filters (with
+          key 'w') or biases (with key 'b'). The default initializer for the
+          weights is a truncated normal initializer, which is commonly used
+          when the inputs are zero centered (see
+          https://arxiv.org/pdf/1502.03167v3.pdf). The default initializer for
+          the bias is a zero initializer.
+      partitioners: Optional dict containing partitioners to partition
+          weights (with key 'w') or biases (with key 'b'). As a default, no
+          partitioners are used.
+      regularizers: Optional dict containing regularizers for the filters
+        (with key 'w') and the biases (with key 'b'). As a default, no
+        regularizers are used. A regularizer should be a function that takes
+        a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
+        the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
+      name: Name of the module.
+
+    Raises:
+      base.IncompatibleShapeError: If the given kernel shape is not an integer;
+          or if the given kernel shape is not a sequence of two integers.
+      base.IncompatibleShapeError: If the given stride is not an integer; or if
+          the given stride is not a sequence of two or four integers.
+      base.IncompatibleShapeError: If the given rate is not an integer; or if
+          the given rate is not a sequence of two integers.
+      base.NotSupportedError: If rate in any dimension and the stride in any
+          dimension are simultaneously > 1.
+      KeyError: If `initializers`, `partitioners` or `regularizers` contain any
+        keys other than 'w' or 'b'.
+      TypeError: If any of the given initializers, partitioners or regularizers
+        are not callable.
+    """
+    super(CausalConv1D, self).__init__(
+        output_channels=output_channels,
+        kernel_shape=kernel_shape,
+        stride=stride,
+        rate=rate,
+        padding=VALID,  # Can't be configured by the user.
+        use_bias=use_bias,
+        initializers=initializers,
+        partitioners=partitioners,
+        regularizers=regularizers,
+        custom_getter=custom_getter,
+        name=name)
+
+  def _build(self, inputs):
+    """Connects the CausalConv1D module into the graph, with `inputs` as input.
+
+    If this is not the first time the module has been connected to the graph,
+    the input Tensor provided here must have the same final 2 dimensions, in
+    order for the existing variables to be the correct size for the
+    multiplication. The batch size may differ for each connection.
+
+    Args:
+      inputs: A 3D Tensor of shape [batch_size, input_length, input_channels].
+
+    Returns:
+      A 3D Tensor of shape [batch_size, output_length, output_channels].
+
+    Raises:
+      ValueError: If connecting the module into the graph any time after the
+          first time and the inferred size of the input does not match previous
+          invocations.
+      base.IncompatibleShapeError: If the input tensor has the wrong number
+          of dimensions.
+      base.IncompatibleShapeError: If a mask is present and its shape is
+          incompatible with the shape of the weights.
+      base.UnderspecifiedError: If the input tensor has an unknown
+          `input_channels`.
+      TypeError: If input Tensor dtype is not `tf.float32`.
+    """
+    # Handle input whose shape is unknown during graph creation.
+    self._input_shape = tuple(inputs.get_shape().as_list())
+
+    if len(self._input_shape) != 3:
+      raise base.IncompatibleShapeError(
+          "Input Tensor must have shape (batch_size, input_length, input_"
+          "channels)")
+
+
+    if self._input_shape[2] is None:
+      raise base.UnderspecifiedError(
+          "Number of input channels must be known at module build time")
+    else:
+      input_channels = self._input_shape[2]
+
+    if inputs.dtype != tf.float32:
+      raise TypeError("Input must have dtype tf.float32, but dtype was {}".
+                      format(inputs.dtype))
+
+    weight_shape = (self._kernel_shape[0], input_channels, self.output_channels)
+
+    bias_shape = (self.output_channels,)
+
+    if "w" not in self._initializers:
+      self._initializers["w"] = create_weight_initializer(weight_shape[:2])
+
+    if "b" not in self._initializers and self._use_bias:
+      self._initializers["b"] = create_bias_initializer(bias_shape)
+
+    self._w = tf.get_variable(
+        "w",
+        shape=weight_shape,
+        initializer=self._initializers["w"],
+        partitioner=self._partitioners.get("w", None),
+        regularizer=self._regularizers.get("w", None))
+
+    pad_amount = int((self._kernel_shape[0] - 1) * self._rate[0])
+    padded_inputs = tf.pad(inputs, paddings=[[0, 0], [pad_amount, 0], [0, 0]])
+
+    outputs = tf.nn.convolution(
+        padded_inputs,
+        self._w,
+        strides=self._stride,
+        padding=VALID,
+        dilation_rate=self._rate)
+
+    if self._use_bias:
+      self._b = tf.get_variable(
+          "b",
+          shape=bias_shape,
+          initializer=self._initializers["b"],
+          partitioner=self._partitioners.get("b", None),
+          regularizer=self._regularizers.get("b", None))
+      outputs += self._b
+
+    return outputs
 
 
 class InPlaneConv2D(base.AbstractModule):
@@ -1409,12 +1707,12 @@ class InPlaneConv2D(base.AbstractModule):
 
   def __init__(self, kernel_shape, stride=1, padding=SAME, use_bias=True,
                initializers=None, partitioners=None, regularizers=None,
-               name="in_plane_conv2d"):
+               custom_getter=None, name="in_plane_conv2d"):
     """Constructs an InPlaneConv2D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       kernel_shape: Iterable with 2 elements in the layout [filter_height,
@@ -1434,6 +1732,10 @@ class InPlaneConv2D(base.AbstractModule):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -1449,7 +1751,7 @@ class InPlaneConv2D(base.AbstractModule):
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(InPlaneConv2D, self).__init__(name=name)
+    super(InPlaneConv2D, self).__init__(custom_getter=custom_getter, name=name)
 
     self._kernel_shape = _fill_and_verify_parameter_shape(kernel_shape, 2,
                                                           "kernel")
@@ -1645,12 +1947,13 @@ class DepthwiseConv2D(base.AbstractModule):
                initializers=None,
                partitioners=None,
                regularizers=None,
+               custom_getter=None,
                name="conv_2d_depthwise"):
     """Constructs a DepthwiseConv2D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       channel_multiplier: Number of channels to expand convolution to. Must be
@@ -1679,6 +1982,10 @@ class DepthwiseConv2D(base.AbstractModule):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -1695,7 +2002,8 @@ class DepthwiseConv2D(base.AbstractModule):
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(DepthwiseConv2D, self).__init__(name=name)
+    super(DepthwiseConv2D, self).__init__(custom_getter=custom_getter,
+                                          name=name)
 
     if (not isinstance(channel_multiplier, numbers.Integral) or
         channel_multiplier < 1):
@@ -1914,12 +2222,13 @@ class SeparableConv2D(base.AbstractModule):
                initializers=None,
                partitioners=None,
                regularizers=None,
+               custom_getter=None,
                name="Separable_conv2d"):
     """Constructs a SeparableConv2D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. Must be an integer.
@@ -1949,6 +2258,10 @@ class SeparableConv2D(base.AbstractModule):
         A regularizer should be a function that takes a single `Tensor` as an
         input and returns a scalar `Tensor` output, e.g. the L1 and L2
         regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -1958,13 +2271,14 @@ class SeparableConv2D(base.AbstractModule):
           list of 3 integers.
       base.IncompatibleShapeError: If `stride` is neither an integer nor a
           list of 2 or 4 integers.
-      ValueError: If `padding` is not `nnd.VALID` or `nnd.SAME`;
+      ValueError: If `padding` is not `snt.VALID` or `snt.SAME`;
       KeyError: If `initializers`, `partitioners` or `regularizers` contain any
         keys other than 'w_dw', 'w_pw' or 'b'.
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(SeparableConv2D, self).__init__(name=name)
+    super(SeparableConv2D, self).__init__(custom_getter=custom_getter,
+                                          name=name)
 
     if not isinstance(output_channels, numbers.Integral) or output_channels < 1:
       raise ValueError("output_channels (={}), must be integer >= 1".format(
@@ -2193,12 +2507,13 @@ class Conv3D(base.AbstractModule):
 
   def __init__(self, output_channels, kernel_shape, stride=1, rate=1,
                padding=SAME, use_bias=True, initializers=None,
-               partitioners=None, regularizers=None, name="conv_3d"):
+               partitioners=None, regularizers=None, custom_getter=None,
+               name="conv_3d"):
     """Constructs a Conv3D module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. `output_channels` can be
@@ -2230,6 +2545,10 @@ class Conv3D(base.AbstractModule):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -2247,7 +2566,7 @@ class Conv3D(base.AbstractModule):
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(Conv3D, self).__init__(name=name)
+    super(Conv3D, self).__init__(custom_getter=custom_getter, name=name)
 
     self._output_channels = output_channels
     self._input_shape = None
@@ -2453,6 +2772,7 @@ class Conv3D(base.AbstractModule):
                            initializers=self.initializers,
                            partitioners=self.partitioners,
                            regularizers=self.regularizers,
+                           custom_getter=self._custom_getter,
                            name=name)
 
 
@@ -2463,14 +2783,15 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
   abstracting away variable creation and sharing.
   """
 
-  def __init__(self, output_channels, output_shape, kernel_shape, stride=1,
-               padding=SAME, use_bias=True, initializers=None,
-               partitioners=None, regularizers=None, name="conv_3d_transpose"):
+  def __init__(self, output_channels, output_shape=None, kernel_shape=None,
+               stride=1, padding=SAME, use_bias=True, initializers=None,
+               partitioners=None, regularizers=None, custom_getter=None,
+               name="conv_3d_transpose"):
     """Constructs a `Conv3DTranspose` module.
 
     See the following documentation for an explanation of VALID versus SAME
     padding modes:
-    https://www.tensorflow.org/versions/r0.8/api_docs/python/nn.html#convolution
+    https://www.tensorflow.org/api_guides/python/nn#Convolution
 
     Args:
       output_channels: Number of output channels. `output_channels` can be
@@ -2485,6 +2806,8 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
           returning an iterable of format `(out_depth, out_height, out_width)`
           when `build` is called. Note that `output_shape` defines the size of
           output signal domain, as opposed to the shape of the output `Tensor`.
+          If a None value is given, a default shape is automatically calculated
+          (see docstring of _default_transpose_size function for more details).
       kernel_shape: Sequence of kernel sizes (of size 3), or integer that is
           used to define kernel size in all dimensions.
       stride: Sequence of kernel strides (of size 3), or integer that is used to
@@ -2501,6 +2824,10 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
         regularizers are used. A regularizer should be a function that takes
         a single `Tensor` as an input and returns a scalar `Tensor` output, e.g.
         the L1 and L2 regularizers in `tf.contrib.layers`.
+      custom_getter: Callable or dictionary of callables to use as
+        custom getters inside the module. If a dictionary, the keys
+        correspond to regexes to match variable names. See the `tf.get_variable`
+        documentation for information about the custom_getter API.
       name: Name of the module.
 
     Raises:
@@ -2509,20 +2836,32 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
       module.IncompatibleShapeError: If the given stride is neither an integer
           nor a sequence of three or five integers.
       ValueError: If the given padding is not `snt.VALID` or `snt.SAME`.
+      ValueError: If the given kernel_shape is `None`.
       KeyError: If `initializers`, `partitioners` or `regularizers` contain any
         keys other than 'w' or 'b'.
       TypeError: If any of the given initializers, partitioners or regularizers
         are not callable.
     """
-    super(Conv3DTranspose, self).__init__(name=name)
+    super(Conv3DTranspose, self).__init__(custom_getter=custom_getter,
+                                          name=name)
 
     self._output_channels = output_channels
-    if callable(output_shape):
-      self._output_shape = output_shape
+
+    if output_shape is None:
+      self._output_shape = None
+      self._use_default_output_shape = True
     else:
-      self._output_shape = tuple(output_shape)
+      self._use_default_output_shape = False
+      if callable(output_shape):
+        self._output_shape = output_shape
+      else:
+        self._output_shape = _fill_and_verify_parameter_shape(output_shape, 3,
+                                                              "output_shape")
+
     self._input_shape = None
 
+    if kernel_shape is None:
+      raise ValueError("`kernel_shape` cannot be None.")
     self._kernel_shape = _fill_and_verify_parameter_shape(kernel_shape, 3,
                                                           "kernel")
     # We want to support passing native strides akin to [1, m, n, o, 1].
@@ -2591,6 +2930,13 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
     if inputs.dtype != tf.float32:
       raise TypeError("Input must have dtype tf.float32, but dtype was " +
                       inputs.dtype)
+
+    if self._use_default_output_shape:
+      self._output_shape = (
+          lambda: _default_transpose_size(self._input_shape[1:-1],  # pylint: disable=g-long-lambda
+                                          self.stride[1:-1],
+                                          kernel_shape=self.kernel_shape,
+                                          padding=self.padding))
 
     if len(self.output_shape) != 3:
       raise base.IncompatibleShapeError("Output shape must be specified as "
@@ -2668,6 +3014,8 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
   @property
   def output_shape(self):
     """Returns the output shape."""
+    if self._output_shape is None:
+      self._ensure_is_connected()
     if callable(self._output_shape):
       self._output_shape = tuple(self._output_shape())
     return self._output_shape
@@ -2741,4 +3089,5 @@ class Conv3DTranspose(base.AbstractModule, base.Transposable):
                   initializers=self.initializers,
                   partitioners=self.partitioners,
                   regularizers=self.regularizers,
+                  custom_getter=self._custom_getter,
                   name=name)
